@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20,9 +23,40 @@ jobs:
       # e2e tests start PostgreSQL and NATS with testcontainers (Docker is available on GitHub runners).
       - run: go test -race -count=1 ./...
 
-  image:
+  # Deploy the Helm chart to a throwaway kind cluster and run `helm test`.
+  kubernetes:
     needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t payhook:ci .
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/payhook --set secrets.databaseURL=postgres://ci
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: payhook
+      - run: deploy/kind/up.sh
+      - if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl logs -l app.kubernetes.io/name=payhook --all-containers --tail=50
+
+  image:
+    needs: [test, kubernetes]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:main
+            ghcr.io/${{ github.repository }}:${{ github.sha }}

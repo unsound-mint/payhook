@@ -1,0 +1,90 @@
+{{- range $name, $c := .Values.components }}
+{{- $ctx := dict "root" $ "component" $name }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "payhook.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "payhook.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  {{- if not (and (eq $name "api") $.Values.autoscaling.enabled) }}
+  replicas: {{ $c.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: {{- include "payhook.selector" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "payhook.selector" $ctx | nindent 8 }}
+      annotations:
+        # Roll the pods when the secret changes.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") $ | sha256sum }}
+        {{- with $.Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{ end }}
+    spec:
+      # api: 15s graceful HTTP shutdown + 5s preStop; workers drain in-flight messages.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: {{ $name }}
+          image: {{ include "payhook.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: [{{ $name | quote }}]
+          envFrom:
+            - secretRef: { name: {{ include "payhook.secretName" $ }} }
+          env:
+            - { name: NATS_URL, value: {{ $.Values.natsURL | quote }} }
+            {{- if $c.metricsPort }}
+            - { name: METRICS_ADDR, value: {{ printf ":%v" $c.metricsPort | quote }} }
+            {{- end }}
+          ports:
+            {{- if $c.port }}
+            - { name: http, containerPort: {{ $c.port }} }
+            {{- else }}
+            - { name: metrics, containerPort: {{ $c.metricsPort }} }
+            {{- end }}
+          {{- if $c.port }}
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            # Give the Service time to drop this pod from its endpoints before
+            # the process starts refusing connections.
+            preStop:
+              sleep: { seconds: 5 }
+          {{- else }}
+          livenessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            periodSeconds: 15
+            failureThreshold: 3
+          {{- end }}
+          resources: {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+      {{- with $.Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "payhook.selector" $ctx | nindent 14 }}
+{{- end }}

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: payhook
+description: Payments and webhooks service (api, outbox relay, notifier worker)
+type: application
+version: 0.1.0
+appVersion: "main"
+home: https://github.com/unsound-mint/payhook

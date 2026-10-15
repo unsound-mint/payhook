@@ -1,0 +1,22 @@
+# `helm test <release>`: create a payment through the Service and read it back.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "payhook.fullname" . }}-smoke
+  labels: {{- include "payhook.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: smoke
+      image: curlimages/curl:8.16.0
+      command: ["sh", "-ec"]
+      args:
+        - |
+          URL=http://{{ include "payhook.fullname" . }}:{{ .Values.service.port }}
+          ID=$(curl -fsS -X POST $URL/v1/payments -H "Idempotency-Key: helm-test-$(date +%s)" \
+            -d '{"merchant_id":"helm-test","amount":100,"currency":"KZT"}' | sed -E 's/.*"id":"([^"]+)".*/\1/')
+          curl -fsS $URL/v1/payments/$ID | grep -q '"status":"pending"'
+          echo "ok: $ID"

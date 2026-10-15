@@ -1,0 +1,7 @@
+payhook {{ .Chart.AppVersion }} installed.
+
+  kubectl port-forward svc/{{ include "payhook.fullname" . }} 8080:{{ .Values.service.port }}
+  curl -X POST localhost:8080/v1/payments -H 'Idempotency-Key: k1' \
+    -d '{"merchant_id":"shop-1","amount":1500,"currency":"KZT"}'
+
+Smoke test: helm test {{ .Release.Name }}

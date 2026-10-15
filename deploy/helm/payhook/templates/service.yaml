@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "payhook.fullname" . }}
+  labels: {{- include "payhook.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "payhook.selector" (dict "root" . "component" "api") | nindent 4 }}
+  ports:
+    - { name: http, port: {{ .Values.service.port }}, targetPort: http }
+---
+# Headless services so Prometheus can scrape the relay and worker pods.
+{{- range $name := list "relay" "worker" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "payhook.fullname" $ }}-{{ $name }}-metrics
+  labels:
+    {{- include "payhook.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  clusterIP: None
+  selector: {{- include "payhook.selector" (dict "root" $ "component" $name) | nindent 4 }}
+  ports:
+    - { name: metrics, port: {{ (index $.Values.components $name).metricsPort }}, targetPort: metrics }
+---
+{{- end }}

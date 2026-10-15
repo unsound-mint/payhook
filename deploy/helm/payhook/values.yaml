@@ -1,0 +1,63 @@
+image:
+  repository: ghcr.io/unsound-mint/payhook
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# Connection settings. In production put these in an existing Secret
+# (e.g. synced by External Secrets from AWS Secrets Manager) and set existingSecret.
+existingSecret: ""
+secrets:
+  databaseURL: ""
+  webhookSecrets: ""   # "halyk=...,kaspi=..."
+  callbackSecret: ""
+natsURL: nats://nats:4222
+
+# One Deployment per component; all run the same image with a different command.
+components:
+  api:
+    replicas: 2
+    port: 8080
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 256Mi }
+  relay:
+    # Safe to run more than one (FOR UPDATE SKIP LOCKED), but one keeps event order simple.
+    replicas: 1
+    metricsPort: 9101
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { memory: 128Mi }
+  worker:
+    replicas: 2
+    metricsPort: 9102
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { memory: 128Mi }
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  host: payhook.local
+  tls: []
+
+serviceMonitor:
+  enabled: false     # needs the Prometheus Operator CRDs
+  interval: 15s
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []

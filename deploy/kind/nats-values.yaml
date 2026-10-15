@@ -1,0 +1,5 @@
+config:
+  jetstream:
+    enabled: true
+    fileStore:
+      pvc: { size: 1Gi }

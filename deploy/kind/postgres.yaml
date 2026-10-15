@@ -1,0 +1,35 @@
+# Single-replica Postgres for the local kind cluster only. In AWS the database is RDS (see payhook-infra).
+apiVersion: v1
+kind: Secret
+metadata: { name: postgres }
+stringData: { POSTGRES_USER: payhook, POSTGRES_PASSWORD: payhook, POSTGRES_DB: payhook }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: postgres }
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          envFrom: [{ secretRef: { name: postgres } }]
+          ports: [{ containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "payhook"] }
+            periodSeconds: 3
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432 }]

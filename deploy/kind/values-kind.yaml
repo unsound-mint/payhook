@@ -1,0 +1,11 @@
+image:
+  repository: payhook
+  tag: dev
+  pullPolicy: Never      # loaded into kind with `kind load docker-image`
+secrets:
+  databaseURL: postgres://payhook:payhook@postgres:5432/payhook?sslmode=disable
+  webhookSecrets: halyk=whsec_local_halyk
+  callbackSecret: whsec_local_callback
+natsURL: nats://nats:4222
+autoscaling:
+  enabled: true
