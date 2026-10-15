@@ -1,0 +1,174 @@
+// Package notifier consumes payment events and calls the merchant's callback URL.
+//
+// Delivery is at least once end to end, so this consumer:
+//   - skips messages it already processed (processed_messages table),
+//   - retries failed callbacks with growing delays (NakWithDelay),
+//   - parks a message in dead_letters after the last attempt instead of
+//     retrying forever.
+//
+// Merchants should still dedupe on the event id: if we crash after a successful
+// callback but before recording it, the callback is sent again.
+package notifier
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/unsound-mint/payhook/internal/broker"
+	"github.com/unsound-mint/payhook/internal/metrics"
+	"github.com/unsound-mint/payhook/internal/payment"
+	"github.com/unsound-mint/payhook/internal/webhook"
+)
+
+const consumerName = "notifier"
+
+// Backoff between callback attempts. len(Backoff)+1 is the max number of attempts.
+var Backoff = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
+
+type Notifier struct {
+	pool   *pgxpool.Pool
+	store  *payment.Store
+	client *http.Client
+	secret []byte
+	log    *slog.Logger
+}
+
+func New(pool *pgxpool.Pool, store *payment.Store, secret []byte, log *slog.Logger) *Notifier {
+	return &Notifier{pool: pool, store: store, client: &http.Client{Timeout: 5 * time.Second}, secret: secret, log: log}
+}
+
+func (n *Notifier) Run(ctx context.Context, js jetstream.JetStream) error {
+	cons, err := js.CreateOrUpdateConsumer(ctx, broker.Stream, jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       30 * time.Second,
+		MaxDeliver:    len(Backoff) + 1,
+		FilterSubject: broker.Subjects,
+	})
+	if err != nil {
+		return err
+	}
+	cc, err := cons.Consume(func(msg jetstream.Msg) { n.handle(ctx, msg) })
+	if err != nil {
+		return err
+	}
+	<-ctx.Done()
+	cc.Drain() // finish in-flight messages before exiting
+	return nil
+}
+
+func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
+	var ev payment.Event
+	if err := json.Unmarshal(msg.Data(), &ev); err != nil || ev.ID == "" {
+		n.log.Error("dropping malformed message", "err", err)
+		settle(n.log, "term", msg.Term())
+		return
+	}
+	attempt := uint64(1)
+	if meta, err := msg.Metadata(); err == nil {
+		attempt = meta.NumDelivered
+	}
+	log := n.log.With("event_id", ev.ID, "type", ev.Type, "attempt", attempt)
+
+	done, err := n.alreadyProcessed(ctx, ev.ID)
+	if err != nil {
+		log.Error("dedupe check failed", "err", err)
+		settle(log, "nak", msg.NakWithDelay(time.Second))
+		return
+	}
+	if done {
+		metrics.Deliveries.WithLabelValues("duplicate").Inc()
+		settle(log, "ack", msg.Ack())
+		return
+	}
+
+	url, err := n.store.CallbackURL(ctx, ev.PaymentID)
+	if err != nil && !errors.Is(err, payment.ErrNotFound) {
+		log.Error("callback lookup failed", "err", err)
+		settle(log, "nak", msg.NakWithDelay(time.Second))
+		return
+	}
+	if url == "" {
+		n.markProcessed(ctx, ev.ID)
+		metrics.Deliveries.WithLabelValues("skipped").Inc()
+		settle(log, "ack", msg.Ack())
+		return
+	}
+
+	if err := n.deliver(ctx, url, msg.Data()); err != nil {
+		if int(attempt) > len(Backoff) {
+			log.Error("giving up, moving to dead letters", "err", err)
+			n.deadLetter(ctx, ev.ID, msg.Data(), err)
+			metrics.Deliveries.WithLabelValues("dead_letter").Inc()
+			settle(log, "term", msg.Term())
+			return
+		}
+		delay := Backoff[attempt-1]
+		log.Warn("callback failed, retrying", "err", err, "in", delay)
+		metrics.Deliveries.WithLabelValues("retry").Inc()
+		settle(log, "nak", msg.NakWithDelay(delay))
+		return
+	}
+	n.markProcessed(ctx, ev.ID)
+	metrics.Deliveries.WithLabelValues("ok").Inc()
+	settle(log, "ack", msg.Ack())
+}
+
+// deliver POSTs the event, signed the same way providers sign webhooks to us,
+// so the merchant can verify it came from us.
+func (n *Notifier) deliver(ctx context.Context, url string, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Signature", webhook.Sign(n.secret, time.Now(), body))
+	resp, err := n.client.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("merchant responded %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// settle logs a failed ack/nak/term. The message will then be redelivered after
+// AckWait, which the dedupe check makes harmless.
+func settle(log *slog.Logger, op string, err error) {
+	if err != nil {
+		log.Warn("settling message failed", "op", op, "err", err)
+	}
+}
+
+func (n *Notifier) alreadyProcessed(ctx context.Context, id string) (bool, error) {
+	var ok bool
+	err := n.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM processed_messages WHERE consumer = $1 AND message_id = $2)`,
+		consumerName, id).Scan(&ok)
+	return ok, err
+}
+
+func (n *Notifier) markProcessed(ctx context.Context, id string) {
+	if _, err := n.pool.Exec(ctx, `INSERT INTO processed_messages (consumer, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+		consumerName, id); err != nil {
+		n.log.Error("mark processed failed", "event_id", id, "err", err)
+	}
+}
+
+func (n *Notifier) deadLetter(ctx context.Context, id string, payload []byte, cause error) {
+	if _, err := n.pool.Exec(ctx, `INSERT INTO dead_letters (consumer, message_id, payload, last_error) VALUES ($1, $2, $3, $4)`,
+		consumerName, id, payload, cause.Error()); err != nil {
+		n.log.Error("dead letter insert failed", "event_id", id, "err", err)
+	}
+	n.markProcessed(ctx, id)
+}

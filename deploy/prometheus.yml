@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: payhook-api
+    static_configs: [{ targets: ["api:8080"] }]
+  - job_name: payhook-relay
+    static_configs: [{ targets: ["relay:9101"] }]
+  - job_name: payhook-worker
+    static_configs: [{ targets: ["worker:9102"] }]

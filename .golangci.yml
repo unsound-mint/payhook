@@ -1,0 +1,17 @@
+version: "2"
+linters:
+  enable: [bodyclose, errorlint, gosec, misspell, unconvert]
+  settings:
+    errcheck:
+      # Best-effort cleanup calls whose errors carry no useful signal.
+      exclude-functions:
+        - (github.com/jackc/pgx/v5.Tx).Rollback
+        - (*github.com/nats-io/nats.go.Conn).Drain
+        - (io.Closer).Close
+        - (*encoding/json.Encoder).Encode
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [errcheck, gosec]
+      - path: cmd/sendwebhook
+        linters: [errcheck, gosec]
