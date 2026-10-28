@@ -14,7 +14,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/unsound-mint/payhook/internal/metrics"
 	"github.com/unsound-mint/payhook/internal/payment"
@@ -40,7 +39,8 @@ func (s *Server) Routes() http.Handler {
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	r.Get("/readyz", s.ready)
-	r.Handle("/metrics", promhttp.Handler())
+	// /metrics is not here on purpose: it's served on its own port (metrics.Serve)
+	// so that exposing the API publicly doesn't expose the metrics too.
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/payments", s.createPayment)

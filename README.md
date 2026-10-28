@@ -16,7 +16,7 @@ flowchart LR
     W -- "signed callback" --> M
 ```
 
-Three binaries from one codebase: **api** (REST + webhooks), **relay** (outbox → NATS), **worker** (NATS → merchant callbacks). Each exposes Prometheus metrics. Runs with Docker Compose, on Kubernetes (Helm chart), and on AWS ([payhook-infra](https://github.com/unsound-mint/payhook-infra), Terraform).
+Three binaries from one codebase: **api** (REST + webhooks), **relay** (outbox → NATS), **worker** (NATS → merchant callbacks). Each exposes Prometheus metrics on its own port (`METRICS_ADDR`, default `:9100` / `:9101` / `:9102`), separate from the public API. Runs with Docker Compose, on Kubernetes (Helm chart), and on AWS ([payhook-infra](https://github.com/unsound-mint/payhook-infra), Terraform).
 
 ## What it handles
 

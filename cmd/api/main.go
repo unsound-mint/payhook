@@ -14,6 +14,7 @@ import (
 	"github.com/unsound-mint/payhook/internal/config"
 	"github.com/unsound-mint/payhook/internal/db"
 	"github.com/unsound-mint/payhook/internal/httpapi"
+	"github.com/unsound-mint/payhook/internal/metrics"
 	"github.com/unsound-mint/payhook/internal/payment"
 )
 
@@ -41,6 +42,16 @@ func run(log *slog.Logger) error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
+
+	go func() {
+		addr := os.Getenv("METRICS_ADDR")
+		if addr == "" {
+			addr = ":9100"
+		}
+		if err := metrics.Serve(addr); err != nil {
+			log.Error("metrics server", "err", err)
+		}
+	}()
 
 	srv := &http.Server{
 		Addr: cfg.HTTPAddr,

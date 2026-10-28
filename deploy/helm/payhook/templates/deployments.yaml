@@ -47,9 +47,8 @@ spec:
           ports:
             {{- if $c.port }}
             - { name: http, containerPort: {{ $c.port }} }
-            {{- else }}
-            - { name: metrics, containerPort: {{ $c.metricsPort }} }
             {{- end }}
+            - { name: metrics, containerPort: {{ $c.metricsPort }} }
           {{- if $c.port }}
           readinessProbe:
             httpGet: { path: /readyz, port: http }

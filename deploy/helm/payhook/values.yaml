@@ -17,6 +17,7 @@ components:
   api:
     replicas: 2
     port: 8080
+    metricsPort: 9100  # separate from the API port, so the Ingress never exposes /metrics
     resources:
       requests: { cpu: 50m, memory: 64Mi }
       limits: { memory: 256Mi }

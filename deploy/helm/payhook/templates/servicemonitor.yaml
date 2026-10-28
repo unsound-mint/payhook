@@ -9,9 +9,6 @@ spec:
     matchLabels:
       app.kubernetes.io/instance: {{ .Release.Name }}
   endpoints:
-    - port: http
-      path: /metrics
-      interval: {{ .Values.serviceMonitor.interval }}
     - port: metrics
       interval: {{ .Values.serviceMonitor.interval }}
 {{- end }}

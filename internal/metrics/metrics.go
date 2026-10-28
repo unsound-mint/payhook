@@ -38,8 +38,8 @@ var (
 	}, []string{"result"})
 )
 
-// Serve exposes /metrics on addr. Used by the relay and worker, which have no
-// HTTP API of their own.
+// Serve exposes /metrics on addr. Every binary serves it on a separate port
+// (api :9100, relay :9101, worker :9102), never on the public API listener.
 func Serve(addr string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())

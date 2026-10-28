@@ -9,8 +9,8 @@ spec:
   ports:
     - { name: http, port: {{ .Values.service.port }}, targetPort: http }
 ---
-# Headless services so Prometheus can scrape the relay and worker pods.
-{{- range $name := list "relay" "worker" }}
+# Headless services so Prometheus can scrape every pod on its metrics port.
+{{- range $name := list "api" "relay" "worker" }}
 apiVersion: v1
 kind: Service
 metadata:
