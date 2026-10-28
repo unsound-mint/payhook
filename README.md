@@ -28,9 +28,9 @@ Three binaries from one codebase: **api** (REST + webhooks), **relay** (outbox �
 | Forged or replayed webhooks | HMAC-SHA256 over `timestamp.body`, constant-time comparison, 5-minute tolerance window. |
 | Crash between "update DB" and "publish event" | Transactional outbox: the event is written in the same transaction as the change; the relay publishes it afterwards. Several relays can run in parallel (`SKIP LOCKED`). |
 | Relay publishes but crashes before marking the row | JetStream dedupe window keyed on the outbox id (`Nats-Msg-Id`), plus consumer-side dedupe. |
-| Merchant endpoint is down | Retries with growing delays (1s, 5s, 30s, 2m, 10m) via `NakWithDelay`; after the last attempt the message goes to `dead_letters` instead of retrying forever. Callbacks are signed so merchants can verify them. |
+| Merchant endpoint is down | Retries with growing delays (1s, 5s, 30s, 2m, 10m) via `NakWithDelay`; after the last attempt the message goes to `dead_letters` with the merchant's last error instead of retrying forever. Attempts are counted in PostgreSQL, so redeliveries caused by our own failures (database down, shutdown) don't use them up. Callbacks are signed so merchants can verify them. |
 | Merchant points `callback_url` at our internal network (SSRF) | `https` only, no literal internal IPs or `localhost` at creation; at connect time the resolved IP is checked again (loopback, private, link-local/metadata, CGNAT are refused), redirects are not followed, no proxy from the environment. `PAYHOOK_ALLOW_PRIVATE_CALLBACKS=true` lifts this for local runs and tests. |
-| Deploys | Graceful shutdown (in-flight HTTP requests and messages finish), `/healthz` and `/readyz`, migrations guarded by an advisory lock so replicas can start together. |
+| Deploys | Graceful shutdown: the API lets in-flight requests finish (up to 15 s); the worker stops fetching and finishes the callback in progress (up to 12 s, within the 30 s grace period), and anything left unacknowledged is redelivered and deduplicated. `/healthz` and `/readyz`, migrations guarded by an advisory lock so replicas can start together. |
 
 ## Run it
 
@@ -83,7 +83,8 @@ The end-to-end tests start real PostgreSQL and NATS with testcontainers and run 
 - full lifecycle: idempotent create, webhook applied, redelivery ignored, out-of-order event rejected, merchant callback that fails once and then succeeds — exactly one accepted callback;
 - 30 concurrent webhooks for one payment, redeliveries of one `succeeded` event racing distinct `failed` events → exactly one status change, the payment ends in the winner's status, one outbox row;
 - 20 concurrent creates with the same idempotency key → one payment, one 201;
-- a merchant that never accepts → one dead letter after the last attempt, also when the first dead-letter write fails;
+- a merchant that never accepts → one dead letter with the merchant's error after the last attempt, also when the first dead-letter writes fail, and no callbacks after the last attempt;
+- a database outage longer than all retries together → no attempt is used up, the callback goes out once the database is back;
 - shutdown during a callback → the callback completes and is recorded before the worker exits;
 - an outbox row that isn't a valid event is set aside without blocking the rows behind it;
 - bad signature → 401.
@@ -120,6 +121,8 @@ deploy/kind                      local Kubernetes setup (also used in CI)
 ## Known limitations
 
 - Event order is not guaranteed end to end. The relay publishes in outbox order, but parallel relays, broker redeliveries and callback retries can deliver a later event before an earlier one. Merchants should compare event `id`s (numeric strings) per payment (status changes of one payment are serialised, so its ids increase in order) or `occurred_at`, and treat the payment's current status as the source of truth.
+
+- Upgrading workers from a version before `delivery_attempts` (migration 0003): old workers set the NATS consumer's `MaxDeliver` to 6 when they start, new ones set it to unlimited, and the last one to start wins. With `MaxDeliver` 6 a message that hits database errors on its 6th delivery is never redelivered. After the rollout, if an old worker pod restarted during it, restart the workers once (`kubectl rollout restart deploy/<release>-worker`).
 
 ## Trade-offs and next steps
 
