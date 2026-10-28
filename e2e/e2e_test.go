@@ -1,6 +1,7 @@
 // End-to-end tests against real PostgreSQL and NATS JetStream (via
 // testcontainers). They exercise the API, the outbox relay and the notifier
-// together. Skipped when Docker isn't available.
+// together. Skipped when Docker isn't available, except in CI (CI env var set),
+// where a missing Docker must fail the build instead of passing silently.
 package e2e
 
 import (
@@ -12,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -52,7 +54,7 @@ func setup(t *testing.T) *env {
 		tcpostgres.WithDatabase("payhook"), tcpostgres.WithUsername("payhook"), tcpostgres.WithPassword("payhook"),
 		testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(60*time.Second)))
 	if err != nil {
-		t.Skipf("docker unavailable: %v", err)
+		noDocker(t, err)
 	}
 	t.Cleanup(func() { pg.Terminate(context.Background()) })
 	dsn, err := pg.ConnectionString(ctx, "sslmode=disable")
@@ -62,7 +64,7 @@ func setup(t *testing.T) *env {
 
 	nc, err := tcnats.Run(ctx, "nats:2.11-alpine")
 	if err != nil {
-		t.Skipf("docker unavailable: %v", err)
+		noDocker(t, err)
 	}
 	t.Cleanup(func() { nc.Terminate(context.Background()) })
 	natsURL, err := nc.ConnectionString(ctx)
@@ -100,6 +102,26 @@ func setup(t *testing.T) *env {
 	return &env{api: api, pool: pool}
 }
 
+func noDocker(t *testing.T, err error) {
+	t.Helper()
+	if os.Getenv("CI") != "" {
+		t.Fatalf("docker unavailable in CI: %v", err)
+	}
+	t.Skipf("docker unavailable: %v", err)
+}
+
+// waitFor polls cond until it holds or the timeout expires.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s waiting for %s", timeout, what)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func (e *env) createPayment(t *testing.T, key string, body map[string]any) (int, map[string]any) {
 	t.Helper()
 	b, _ := json.Marshal(body)
@@ -110,24 +132,42 @@ func (e *env) createPayment(t *testing.T, key string, body map[string]any) (int,
 
 func (e *env) webhook(t *testing.T, ev map[string]string) (int, string) {
 	t.Helper()
+	code, outcome, err := e.sendWebhook(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code, outcome
+}
+
+// sendWebhook is the goroutine-safe variant: it returns the error instead of
+// calling t.Fatal, which must only run on the test goroutine.
+func (e *env) sendWebhook(ev map[string]string) (int, string, error) {
 	b, _ := json.Marshal(ev)
 	req, _ := http.NewRequest(http.MethodPost, e.api.URL+"/v1/webhooks/halyk", bytes.NewReader(b))
 	req.Header.Set("X-Signature", webhook.Sign(providerSecret, time.Now(), b))
-	code, out := do(t, req)
+	code, out, err := send(req)
 	outcome, _ := out["outcome"].(string)
-	return code, outcome
+	return code, outcome, err
 }
 
 func do(t *testing.T, req *http.Request) (int, map[string]any) {
 	t.Helper()
-	resp, err := http.DefaultClient.Do(req)
+	code, out, err := send(req)
 	if err != nil {
 		t.Fatal(err)
+	}
+	return code, out
+}
+
+func send(req *http.Request) (int, map[string]any, error) {
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	var out map[string]any
 	json.NewDecoder(resp.Body).Decode(&out)
-	return resp.StatusCode, out
+	return resp.StatusCode, out, nil
 }
 
 func TestPaymentLifecycle(t *testing.T) {
@@ -194,7 +234,14 @@ func TestPaymentLifecycle(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("merchant never received the callback")
 	}
-	time.Sleep(2 * time.Second) // give any duplicate a chance to show up
+	// processed_messages is written after the merchant accepted the callback and
+	// before the ack, so once the row exists no further callback can be sent.
+	waitFor(t, 5*time.Second, "callback recorded as processed", func() bool {
+		var n int
+		err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM processed_messages pm
+			JOIN outbox o ON o.id::text = pm.message_id WHERE o.aggregate_id = $1`, id).Scan(&n)
+		return err == nil && n == 1
+	})
 	if calls.Load() != 2 || accepted.Load() != 1 {
 		t.Fatalf("calls=%d accepted=%d, want 2 and 1 (one retry, no duplicates)", calls.Load(), accepted.Load())
 	}
@@ -228,7 +275,11 @@ func TestConcurrentWebhooks(t *testing.T) {
 			if i%3 == 0 {
 				evID = fmt.Sprintf("evt_other_%d", i) // different event, same target status
 			}
-			_, out := e.webhook(t, map[string]string{"id": evID, "type": "payment.succeeded", "payment_id": id})
+			_, out, err := e.sendWebhook(map[string]string{"id": evID, "type": "payment.succeeded", "payment_id": id})
+			if err != nil {
+				t.Error(err)
+				return
+			}
 			mu.Lock()
 			outcomes[out]++
 			mu.Unlock()
