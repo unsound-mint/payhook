@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -28,6 +29,11 @@ func run(log *slog.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	// Merchants verify callbacks with this secret; an empty key makes the
+	// signature forgeable by anyone.
+	if len(cfg.CallbackSecret) == 0 {
+		return errors.New("PAYHOOK_CALLBACK_SECRET is required")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
-      - run: helm lint deploy/helm/payhook --set secrets.databaseURL=postgres://ci
+      - run: helm lint deploy/helm/payhook --set secrets.databaseURL=postgres://ci --set secrets.callbackSecret=ci
       - uses: helm/kind-action@v1
         with:
           cluster_name: payhook

@@ -9,7 +9,7 @@ existingSecret: ""
 secrets:
   databaseURL: ""
   webhookSecrets: ""   # "halyk=...,kaspi=..."
-  callbackSecret: ""
+  callbackSecret: ""   # required: signs callbacks to merchants
 natsURL: nats://nats:4222
 
 # One Deployment per component; all run the same image with a different command.
