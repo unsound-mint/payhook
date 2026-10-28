@@ -114,7 +114,6 @@ func (r *Relay) PublishBatch(ctx context.Context) (int, error) {
 			if _, err := tx.Exec(ctx, `UPDATE outbox SET failed_at = now(), last_error = $2 WHERE id = $1`, it.id, bad.Error()); err != nil {
 				return 0, err
 			}
-			metrics.OutboxFailed.Inc()
 			failed++
 			continue
 		}
@@ -133,7 +132,11 @@ func (r *Relay) PublishBatch(ctx context.Context) (int, error) {
 		published = append(published, it.id)
 	}
 	if len(published) == 0 {
-		return failed, tx.Commit(ctx)
+		if err := tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		metrics.OutboxFailed.Add(float64(failed))
+		return failed, nil
 	}
 	if _, err := tx.Exec(ctx, `UPDATE outbox SET published_at = now() WHERE id = ANY($1)`, published); err != nil {
 		return 0, err
@@ -144,6 +147,7 @@ func (r *Relay) PublishBatch(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	metrics.OutboxPublished.Add(float64(len(published)))
+	metrics.OutboxFailed.Add(float64(failed))
 	return len(published) + failed, nil
 }
 
