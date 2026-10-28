@@ -24,7 +24,7 @@ logs:
 	docker compose logs -f api relay worker
 
 demo:            ## create a payment and mark it succeeded
-	@ID=$$(curl -s -X POST $(API)/v1/payments -H 'Idempotency-Key: demo-'$$RANDOM \
+	@ID=$$(curl -s -X POST $(API)/v1/payments -H 'Idempotency-Key: demo-$(shell date +%s%N)' \
 		-d '{"merchant_id":"shop-1","amount":1500000,"currency":"KZT"}' | sed -E 's/.*"id":"([^"]+)".*/\1/'); \
 	echo "payment $$ID"; \
 	go run ./cmd/sendwebhook -url $(API)/v1/webhooks/halyk -payment $$ID; echo; \
