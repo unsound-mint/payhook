@@ -3,6 +3,7 @@ package broker
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -15,12 +16,16 @@ const (
 )
 
 type JetStream struct {
-	nc *nats.Conn
-	JS jetstream.JetStream
+	nc     *nats.Conn
+	closed chan struct{}
+	JS     jetstream.JetStream
 }
 
 func Connect(ctx context.Context, url string) (*JetStream, error) {
-	nc, err := nats.Connect(url, nats.Name("payhook"), nats.MaxReconnects(-1))
+	closed := make(chan struct{})
+	var once sync.Once
+	nc, err := nats.Connect(url, nats.Name("payhook"), nats.MaxReconnects(-1),
+		nats.ClosedHandler(func(*nats.Conn) { once.Do(func() { close(closed) }) }))
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +47,7 @@ func Connect(ctx context.Context, url string) (*JetStream, error) {
 		nc.Close()
 		return nil, err
 	}
-	return &JetStream{nc: nc, JS: js}, nil
+	return &JetStream{nc: nc, closed: closed, JS: js}, nil
 }
 
 func (j *JetStream) Publish(ctx context.Context, subject, msgID string, data []byte) error {
@@ -50,5 +55,15 @@ func (j *JetStream) Publish(ctx context.Context, subject, msgID string, data []b
 	return err
 }
 
-// Close drains in-flight messages before closing the connection.
-func (j *JetStream) Close() { _ = j.nc.Drain() }
+// Close drains the connection (flushing pending publishes and acks) and waits
+// for it to close. Drain itself returns immediately.
+func (j *JetStream) Close() {
+	if err := j.nc.Drain(); err != nil {
+		j.nc.Close()
+	}
+	select {
+	case <-j.closed:
+	case <-time.After(5 * time.Second):
+		j.nc.Close()
+	}
+}

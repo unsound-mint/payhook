@@ -40,11 +40,35 @@ var (
 )
 
 type env struct {
-	api  *httptest.Server
-	pool *pgxpool.Pool
+	ctx   context.Context // cancelled when the test ends
+	api   *httptest.Server
+	pool  *pgxpool.Pool
+	js    *broker.JetStream
+	store *payment.Store
+	log   *slog.Logger
 }
 
+// setup starts everything, including a notifier that runs until the test ends.
 func setup(t *testing.T) *env {
+	t.Helper()
+	e := setupWithoutNotifier(t)
+	e.runNotifier(e.ctx, nil)
+	return e
+}
+
+// runNotifier starts a notifier, optionally adjusted by configure, and returns
+// a channel that receives Run's result.
+func (e *env) runNotifier(ctx context.Context, configure func(*notifier.Notifier)) <-chan error {
+	n := notifier.New(e.pool, e.store, callbackSecret, e.log)
+	if configure != nil {
+		configure(n)
+	}
+	done := make(chan error, 1)
+	go func() { done <- n.Run(ctx, e.js.JS) }()
+	return done
+}
+
+func setupWithoutNotifier(t *testing.T) *env {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -92,14 +116,23 @@ func setup(t *testing.T) *env {
 
 	store := payment.NewStore(pool)
 	go outbox.NewRelay(pool, js, log).Run(ctx)
-	go notifier.New(pool, store, callbackSecret, log).Run(ctx, js.JS)
 
 	api := httptest.NewServer((&httpapi.Server{
 		Store: store, Pool: pool, Log: log, Now: time.Now,
 		WebhookSecrets: map[string][]byte{"halyk": providerSecret},
 	}).Routes())
 	t.Cleanup(api.Close)
-	return &env{api: api, pool: pool}
+	return &env{ctx: ctx, api: api, pool: pool, js: js, store: store, log: log}
+}
+
+func (e *env) processedCallbacks(t *testing.T, paymentID string) int {
+	t.Helper()
+	var n int
+	if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM processed_messages pm
+		JOIN outbox o ON o.id::text = pm.message_id WHERE o.aggregate_id = $1`, paymentID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func noDocker(t *testing.T, err error) {
@@ -236,12 +269,7 @@ func TestPaymentLifecycle(t *testing.T) {
 	}
 	// processed_messages is written after the merchant accepted the callback and
 	// before the ack, so once the row exists no further callback can be sent.
-	waitFor(t, 5*time.Second, "callback recorded as processed", func() bool {
-		var n int
-		err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM processed_messages pm
-			JOIN outbox o ON o.id::text = pm.message_id WHERE o.aggregate_id = $1`, id).Scan(&n)
-		return err == nil && n == 1
-	})
+	waitFor(t, 5*time.Second, "callback recorded as processed", func() bool { return e.processedCallbacks(t, id) == 1 })
 	if calls.Load() != 2 || accepted.Load() != 1 {
 		t.Fatalf("calls=%d accepted=%d, want 2 and 1 (one retry, no duplicates)", calls.Load(), accepted.Load())
 	}
@@ -296,5 +324,58 @@ func TestConcurrentWebhooks(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("outbox rows = %d, want 1", n)
+	}
+}
+
+// SIGTERM in the middle of a callback: the callback must complete and be
+// recorded, and Run must not return before that. Otherwise the merchant gets
+// the callback again from another worker.
+func TestShutdownFinishesInFlightCallback(t *testing.T) {
+	e := setupWithoutNotifier(t)
+	ctx, stop := context.WithCancel(e.ctx)
+	defer stop()
+	done := e.runNotifier(ctx, nil)
+
+	var calls atomic.Int32
+	started, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	merchant := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+	}))
+	defer merchant.Close()
+	defer unblock() // runs first, so Close doesn't wait on a blocked handler
+
+	_, p := e.createPayment(t, "order-shutdown", map[string]any{"merchant_id": "shop-1", "amount": 100, "currency": "KZT", "callback_url": merchant.URL})
+	id := p["id"].(string)
+	if _, out := e.webhook(t, map[string]string{"id": "evt_shutdown", "type": "payment.succeeded", "payment_id": id}); out != payment.OutcomeApplied {
+		t.Fatalf("webhook: %s", out)
+	}
+	select {
+	case <-started:
+	case <-time.After(15 * time.Second):
+		t.Fatal("callback never started")
+	}
+
+	stop() // what SIGTERM does in cmd/worker
+	select {
+	case <-done:
+		t.Fatal("Run returned while a callback was still in flight")
+	case <-time.After(300 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after the callback finished")
+	}
+	if n := e.processedCallbacks(t, id); n != 1 || calls.Load() != 1 {
+		t.Fatalf("processed=%d calls=%d, want 1 and 1", n, calls.Load())
 	}
 }

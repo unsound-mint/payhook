@@ -34,6 +34,18 @@ const consumerName = "notifier"
 // Backoff between callback attempts. len(Backoff)+1 is the max number of attempts.
 var Backoff = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
 
+const (
+	// handleTimeout bounds one message. It stays below AckWait so a stuck handler
+	// gives up before the broker hands the message to another worker.
+	handleTimeout = 15 * time.Second
+	// drainTimeout bounds shutdown; the pod's termination grace period is 30s.
+	// Anything still unacked after it is redelivered after AckWait.
+	drainTimeout = 20 * time.Second
+	// pullBuffer is how many messages are fetched ahead. Their AckWait runs while
+	// they sit in the buffer, and shutdown processes the whole buffer, so keep it small.
+	pullBuffer = 10
+)
+
 type Notifier struct {
 	pool   *pgxpool.Pool
 	store  *payment.Store
@@ -57,12 +69,24 @@ func (n *Notifier) Run(ctx context.Context, js jetstream.JetStream) error {
 	if err != nil {
 		return err
 	}
-	cc, err := cons.Consume(func(msg jetstream.Msg) { n.handle(ctx, msg) })
+	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		// Detached from ctx: a shutdown signal must not cancel a callback or the
+		// DB write that records it halfway, which would send the callback again.
+		hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), handleTimeout)
+		defer cancel()
+		n.handle(hctx, msg)
+	}, jetstream.PullMaxMessages(pullBuffer))
 	if err != nil {
 		return err
 	}
 	<-ctx.Done()
-	cc.Drain() // finish in-flight messages before exiting
+	// Stop fetching, finish the message in progress and the buffered ones.
+	cc.Drain()
+	select {
+	case <-cc.Closed():
+	case <-time.After(drainTimeout):
+		n.log.Warn("drain timed out, unacked messages will be redelivered")
+	}
 	return nil
 }
 
