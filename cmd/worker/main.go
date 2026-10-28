@@ -57,5 +57,5 @@ func run(log *slog.Logger) error {
 	}()
 
 	log.Info("worker started")
-	return notifier.New(pool, payment.NewStore(pool), cfg.CallbackSecret, log).Run(ctx, js.JS)
+	return notifier.New(pool, payment.NewStore(pool), cfg.CallbackSecret, cfg.AllowPrivateCallbacks, log).Run(ctx, js.JS)
 }

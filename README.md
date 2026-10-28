@@ -29,6 +29,7 @@ Three binaries from one codebase: **api** (REST + webhooks), **relay** (outbox â
 | Crash between "update DB" and "publish event" | Transactional outbox: the event is written in the same transaction as the change; the relay publishes it afterwards. Several relays can run in parallel (`SKIP LOCKED`). |
 | Relay publishes but crashes before marking the row | JetStream dedupe window keyed on the outbox id (`Nats-Msg-Id`), plus consumer-side dedupe. |
 | Merchant endpoint is down | Retries with growing delays (1s, 5s, 30s, 2m, 10m) via `NakWithDelay`; after the last attempt the message goes to `dead_letters` instead of retrying forever. Callbacks are signed so merchants can verify them. |
+| Merchant points `callback_url` at our internal network (SSRF) | `https` only, no literal internal IPs or `localhost` at creation; at connect time the resolved IP is checked again (loopback, private, link-local/metadata, CGNAT are refused), redirects are not followed, no proxy from the environment. `PAYHOOK_ALLOW_PRIVATE_CALLBACKS=true` lifts this for local runs and tests. |
 | Deploys | Graceful shutdown (in-flight HTTP requests and messages finish), `/healthz` and `/readyz`, migrations guarded by an advisory lock so replicas can start together. |
 
 ## Run it

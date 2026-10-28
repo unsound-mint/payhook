@@ -18,6 +18,7 @@ import (
 
 	"github.com/unsound-mint/payhook/internal/metrics"
 	"github.com/unsound-mint/payhook/internal/payment"
+	"github.com/unsound-mint/payhook/internal/safehttp"
 	"github.com/unsound-mint/payhook/internal/webhook"
 )
 
@@ -27,8 +28,10 @@ type Server struct {
 	Store          *payment.Store
 	Pool           *pgxpool.Pool
 	WebhookSecrets map[string][]byte // provider name -> signing secret
-	Log            *slog.Logger
-	Now            func() time.Time
+	// AllowPrivateCallbacks accepts http and internal callback_url targets (local/tests only).
+	AllowPrivateCallbacks bool
+	Log                   *slog.Logger
+	Now                   func() time.Time
 }
 
 func (s *Server) Routes() http.Handler {
@@ -64,6 +67,12 @@ func (s *Server) createPayment(w http.ResponseWriter, r *http.Request) {
 	if err := req.Validate(); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
+	}
+	if req.CallbackURL != nil {
+		if err := safehttp.CheckURL(*req.CallbackURL, s.AllowPrivateCallbacks); err != nil {
+			writeError(w, http.StatusUnprocessableEntity, "callback_url: "+err.Error())
+			return
+		}
 	}
 	p, created, err := s.Store.Create(r.Context(), key, req)
 	switch {

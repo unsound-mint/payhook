@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/unsound-mint/payhook/internal/broker"
 	"github.com/unsound-mint/payhook/internal/metrics"
 	"github.com/unsound-mint/payhook/internal/payment"
+	"github.com/unsound-mint/payhook/internal/safehttp"
 	"github.com/unsound-mint/payhook/internal/webhook"
 )
 
@@ -56,11 +58,16 @@ type Notifier struct {
 	secret []byte
 	log    *slog.Logger
 
+	allowPrivate bool // see config.AllowPrivateCallbacks
+
 	Backoff []time.Duration // DefaultBackoff unless changed before Run
 }
 
-func New(pool *pgxpool.Pool, store *payment.Store, secret []byte, log *slog.Logger) *Notifier {
-	return &Notifier{pool: pool, store: store, client: &http.Client{Timeout: 5 * time.Second}, secret: secret, log: log, Backoff: DefaultBackoff}
+func New(pool *pgxpool.Pool, store *payment.Store, secret []byte, allowPrivate bool, log *slog.Logger) *Notifier {
+	return &Notifier{
+		pool: pool, store: store, secret: secret, log: log, Backoff: DefaultBackoff,
+		client: safehttp.NewClient(5*time.Second, allowPrivate), allowPrivate: allowPrivate,
+	}
 }
 
 func (n *Notifier) Run(ctx context.Context, js jetstream.JetStream) error {
@@ -113,7 +120,7 @@ func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
 
 	done, err := n.alreadyProcessed(ctx, ev.ID)
 	if err != nil {
-		n.retry(ctx, log, msg, ev.ID, attempt, fmt.Errorf("dedupe check: %w", err), dbRetryDelay)
+		n.retry(ctx, log, msg, ev.ID, n.lastAttempt(attempt), fmt.Errorf("dedupe check: %w", err), dbRetryDelay)
 		return
 	}
 	if done {
@@ -121,16 +128,16 @@ func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
 		settle(log, "ack", msg.Ack())
 		return
 	}
-	if int(attempt) > len(n.Backoff)+1 {
+	if attempt > uint64(len(n.Backoff))+1 {
 		// Redelivered after the last attempt because parking it failed (or our
 		// own failures used up the attempts): don't call the merchant again.
-		n.retry(ctx, log, msg, ev.ID, attempt, errors.New("redelivered after the last attempt, earlier errors are in the logs"), dbRetryDelay)
+		n.retry(ctx, log, msg, ev.ID, true, errors.New("redelivered after the last attempt, earlier errors are in the logs"), dbRetryDelay)
 		return
 	}
 
 	url, err := n.store.CallbackURL(ctx, ev.PaymentID)
 	if err != nil && !errors.Is(err, payment.ErrNotFound) {
-		n.retry(ctx, log, msg, ev.ID, attempt, fmt.Errorf("callback lookup: %w", err), dbRetryDelay)
+		n.retry(ctx, log, msg, ev.ID, n.lastAttempt(attempt), fmt.Errorf("callback lookup: %w", err), dbRetryDelay)
 		return
 	}
 	if url == "" {
@@ -140,12 +147,17 @@ func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
+	// Re-checked here for URLs stored before validation existed; retrying won't fix them.
+	if err := safehttp.CheckURL(url, n.allowPrivate); err != nil {
+		n.retry(ctx, log, msg, ev.ID, true, fmt.Errorf("callback_url: %w", err), 0)
+		return
+	}
 	if err := n.deliver(ctx, url, msg.Data()); err != nil {
 		var delay time.Duration
-		if int(attempt) <= len(n.Backoff) {
+		if !n.lastAttempt(attempt) {
 			delay = n.Backoff[attempt-1]
 		}
-		n.retry(ctx, log, msg, ev.ID, attempt, err, delay)
+		n.retry(ctx, log, msg, ev.ID, n.lastAttempt(attempt), err, delay)
 		return
 	}
 	n.markProcessed(ctx, ev.ID)
@@ -153,11 +165,13 @@ func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
 	settle(log, "ack", msg.Ack())
 }
 
-// retry settles a failed attempt: redeliver after delay or, once the attempts
-// are used up, park the message in dead_letters. It is only terminated after
-// the dead letter is stored; otherwise it is redelivered and parking is retried.
-func (n *Notifier) retry(ctx context.Context, log *slog.Logger, msg jetstream.Msg, id string, attempt uint64, cause error, delay time.Duration) {
-	if int(attempt) <= len(n.Backoff) {
+func (n *Notifier) lastAttempt(attempt uint64) bool { return attempt > uint64(len(n.Backoff)) }
+
+// retry settles a failed attempt: redeliver after delay or, when final, park
+// the message in dead_letters. It is only terminated after the dead letter is
+// stored; otherwise it is redelivered and parking is retried.
+func (n *Notifier) retry(ctx context.Context, log *slog.Logger, msg jetstream.Msg, id string, final bool, cause error, delay time.Duration) {
+	if !final {
 		log.Warn("attempt failed, retrying", "err", cause, "in", delay)
 		metrics.Deliveries.WithLabelValues("retry").Inc()
 		settle(log, "nak", msg.NakWithDelay(delay))
@@ -186,6 +200,8 @@ func (n *Notifier) deliver(ctx context.Context, url string, body []byte) error {
 	if err != nil {
 		return err
 	}
+	// Read a bounded amount so the connection can be reused, then drop the rest.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	_ = resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("merchant responded %d", resp.StatusCode)

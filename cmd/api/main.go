@@ -46,7 +46,8 @@ func run(log *slog.Logger) error {
 		Addr: cfg.HTTPAddr,
 		Handler: (&httpapi.Server{
 			Store: payment.NewStore(pool), Pool: pool,
-			WebhookSecrets: cfg.WebhookSecrets, Log: log, Now: time.Now,
+			WebhookSecrets: cfg.WebhookSecrets, AllowPrivateCallbacks: cfg.AllowPrivateCallbacks,
+			Log: log, Now: time.Now,
 		}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,

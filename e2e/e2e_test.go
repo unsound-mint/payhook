@@ -59,7 +59,8 @@ func setup(t *testing.T) *env {
 // runNotifier starts a notifier, optionally adjusted by configure, and returns
 // a channel that receives Run's result.
 func (e *env) runNotifier(ctx context.Context, configure func(*notifier.Notifier)) <-chan error {
-	n := notifier.New(e.pool, e.store, callbackSecret, e.log)
+	// The merchant stubs are httptest servers on http://127.0.0.1.
+	n := notifier.New(e.pool, e.store, callbackSecret, true, e.log)
 	if configure != nil {
 		configure(n)
 	}
@@ -119,7 +120,8 @@ func setupWithoutNotifier(t *testing.T) *env {
 
 	api := httptest.NewServer((&httpapi.Server{
 		Store: store, Pool: pool, Log: log, Now: time.Now,
-		WebhookSecrets: map[string][]byte{"halyk": providerSecret},
+		WebhookSecrets:        map[string][]byte{"halyk": providerSecret},
+		AllowPrivateCallbacks: true,
 	}).Routes())
 	t.Cleanup(api.Close)
 	return &env{ctx: ctx, api: api, pool: pool, js: js, store: store, log: log}
