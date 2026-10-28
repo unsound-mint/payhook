@@ -31,8 +31,9 @@ import (
 
 const consumerName = "notifier"
 
-// Backoff between callback attempts. len(Backoff)+1 is the max number of attempts.
-var Backoff = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
+// DefaultBackoff is the delay between callback attempts. len(Backoff)+1 is the
+// max number of attempts.
+var DefaultBackoff = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
 
 const (
 	// handleTimeout bounds one message. It stays below AckWait so a stuck handler
@@ -44,6 +45,8 @@ const (
 	// pullBuffer is how many messages are fetched ahead. Their AckWait runs while
 	// they sit in the buffer, and shutdown processes the whole buffer, so keep it small.
 	pullBuffer = 10
+	// dbRetryDelay is the redelivery delay after our own (database) failures.
+	dbRetryDelay = time.Second
 )
 
 type Notifier struct {
@@ -52,18 +55,23 @@ type Notifier struct {
 	client *http.Client
 	secret []byte
 	log    *slog.Logger
+
+	Backoff []time.Duration // DefaultBackoff unless changed before Run
 }
 
 func New(pool *pgxpool.Pool, store *payment.Store, secret []byte, log *slog.Logger) *Notifier {
-	return &Notifier{pool: pool, store: store, client: &http.Client{Timeout: 5 * time.Second}, secret: secret, log: log}
+	return &Notifier{pool: pool, store: store, client: &http.Client{Timeout: 5 * time.Second}, secret: secret, log: log, Backoff: DefaultBackoff}
 }
 
 func (n *Notifier) Run(ctx context.Context, js jetstream.JetStream) error {
 	cons, err := js.CreateOrUpdateConsumer(ctx, broker.Stream, jetstream.ConsumerConfig{
-		Durable:       consumerName,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       30 * time.Second,
-		MaxDeliver:    len(Backoff) + 1,
+		Durable:   consumerName,
+		AckPolicy: jetstream.AckExplicitPolicy,
+		AckWait:   30 * time.Second,
+		// Unlimited: handle caps the attempts itself. With a broker-side limit,
+		// a message whose last attempt hit a database error (or a failed
+		// dead-letter insert) would never be redelivered and would be lost.
+		MaxDeliver:    -1,
 		FilterSubject: broker.Subjects,
 	})
 	if err != nil {
@@ -105,8 +113,7 @@ func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
 
 	done, err := n.alreadyProcessed(ctx, ev.ID)
 	if err != nil {
-		log.Error("dedupe check failed", "err", err)
-		settle(log, "nak", msg.NakWithDelay(time.Second))
+		n.retry(ctx, log, msg, ev.ID, attempt, fmt.Errorf("dedupe check: %w", err), dbRetryDelay)
 		return
 	}
 	if done {
@@ -114,11 +121,16 @@ func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
 		settle(log, "ack", msg.Ack())
 		return
 	}
+	if int(attempt) > len(n.Backoff)+1 {
+		// Redelivered after the last attempt because parking it failed (or our
+		// own failures used up the attempts): don't call the merchant again.
+		n.retry(ctx, log, msg, ev.ID, attempt, errors.New("redelivered after the last attempt, earlier errors are in the logs"), dbRetryDelay)
+		return
+	}
 
 	url, err := n.store.CallbackURL(ctx, ev.PaymentID)
 	if err != nil && !errors.Is(err, payment.ErrNotFound) {
-		log.Error("callback lookup failed", "err", err)
-		settle(log, "nak", msg.NakWithDelay(time.Second))
+		n.retry(ctx, log, msg, ev.ID, attempt, fmt.Errorf("callback lookup: %w", err), dbRetryDelay)
 		return
 	}
 	if url == "" {
@@ -129,22 +141,36 @@ func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
 	}
 
 	if err := n.deliver(ctx, url, msg.Data()); err != nil {
-		if int(attempt) > len(Backoff) {
-			log.Error("giving up, moving to dead letters", "err", err)
-			n.deadLetter(ctx, ev.ID, msg.Data(), err)
-			metrics.Deliveries.WithLabelValues("dead_letter").Inc()
-			settle(log, "term", msg.Term())
-			return
+		var delay time.Duration
+		if int(attempt) <= len(n.Backoff) {
+			delay = n.Backoff[attempt-1]
 		}
-		delay := Backoff[attempt-1]
-		log.Warn("callback failed, retrying", "err", err, "in", delay)
-		metrics.Deliveries.WithLabelValues("retry").Inc()
-		settle(log, "nak", msg.NakWithDelay(delay))
+		n.retry(ctx, log, msg, ev.ID, attempt, err, delay)
 		return
 	}
 	n.markProcessed(ctx, ev.ID)
 	metrics.Deliveries.WithLabelValues("ok").Inc()
 	settle(log, "ack", msg.Ack())
+}
+
+// retry settles a failed attempt: redeliver after delay or, once the attempts
+// are used up, park the message in dead_letters. It is only terminated after
+// the dead letter is stored; otherwise it is redelivered and parking is retried.
+func (n *Notifier) retry(ctx context.Context, log *slog.Logger, msg jetstream.Msg, id string, attempt uint64, cause error, delay time.Duration) {
+	if int(attempt) <= len(n.Backoff) {
+		log.Warn("attempt failed, retrying", "err", cause, "in", delay)
+		metrics.Deliveries.WithLabelValues("retry").Inc()
+		settle(log, "nak", msg.NakWithDelay(delay))
+		return
+	}
+	if err := n.deadLetter(ctx, id, msg.Data(), cause); err != nil {
+		log.Error("dead letter insert failed, will retry", "err", err, "cause", cause)
+		settle(log, "nak", msg.NakWithDelay(dbRetryDelay))
+		return
+	}
+	log.Error("giving up, moved to dead letters", "err", cause)
+	metrics.Deliveries.WithLabelValues("dead_letter").Inc()
+	settle(log, "term", msg.Term())
 }
 
 // deliver POSTs the event, signed the same way providers sign webhooks to us,
@@ -189,10 +215,14 @@ func (n *Notifier) markProcessed(ctx context.Context, id string) {
 	}
 }
 
-func (n *Notifier) deadLetter(ctx context.Context, id string, payload []byte, cause error) {
-	if _, err := n.pool.Exec(ctx, `INSERT INTO dead_letters (consumer, message_id, payload, last_error) VALUES ($1, $2, $3, $4)`,
-		consumerName, id, payload, cause.Error()); err != nil {
-		n.log.Error("dead letter insert failed", "event_id", id, "err", err)
-	}
-	n.markProcessed(ctx, id)
+// deadLetter stores the message and marks it processed in one statement, so a
+// crash in between can't leave a dead letter that is then delivered again.
+func (n *Notifier) deadLetter(ctx context.Context, id string, payload []byte, cause error) error {
+	_, err := n.pool.Exec(ctx, `
+		WITH dl AS (
+			INSERT INTO dead_letters (consumer, message_id, payload, last_error) VALUES ($1, $2, $3, $4)
+		)
+		INSERT INTO processed_messages (consumer, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+		consumerName, id, payload, cause.Error())
+	return err
 }

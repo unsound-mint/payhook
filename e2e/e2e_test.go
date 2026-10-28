@@ -379,3 +379,46 @@ func TestShutdownFinishesInFlightCallback(t *testing.T) {
 		t.Fatalf("processed=%d calls=%d, want 1 and 1", n, calls.Load())
 	}
 }
+
+// A merchant that never accepts: after the last attempt the event is parked in
+// dead_letters exactly once, also when the first try to park it fails.
+func TestDeadLetterAfterLastAttempt(t *testing.T) {
+	e := setupWithoutNotifier(t)
+	e.runNotifier(e.ctx, func(n *notifier.Notifier) { n.Backoff = []time.Duration{50 * time.Millisecond, 50 * time.Millisecond} })
+
+	var calls atomic.Int32
+	merchant := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer merchant.Close()
+
+	// Make the first dead-letter insert fail.
+	ctx := context.Background()
+	if _, err := e.pool.Exec(ctx, `ALTER TABLE dead_letters RENAME TO dead_letters_away`); err != nil {
+		t.Fatal(err)
+	}
+	_, p := e.createPayment(t, "order-dlq", map[string]any{"merchant_id": "shop-1", "amount": 100, "currency": "KZT", "callback_url": merchant.URL})
+	id := p["id"].(string)
+	if _, out := e.webhook(t, map[string]string{"id": "evt_dlq", "type": "payment.succeeded", "payment_id": id}); out != payment.OutcomeApplied {
+		t.Fatalf("webhook: %s", out)
+	}
+	waitFor(t, 15*time.Second, "three callback attempts", func() bool { return calls.Load() == 3 })
+	time.Sleep(300 * time.Millisecond) // let the dead-letter insert fail at least once
+	if _, err := e.pool.Exec(ctx, `ALTER TABLE dead_letters_away RENAME TO dead_letters`); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 15*time.Second, "dead letter", func() bool {
+		var n int
+		err := e.pool.QueryRow(ctx, `SELECT count(*) FROM dead_letters d JOIN outbox o ON o.id::text = d.message_id
+			WHERE o.aggregate_id = $1 AND d.last_error <> ''`, id).Scan(&n)
+		return err == nil && n == 1
+	})
+	if n := e.processedCallbacks(t, id); n != 1 {
+		t.Fatalf("processed = %d, want 1", n)
+	}
+	if c := calls.Load(); c != 3 {
+		t.Fatalf("merchant called %d times, want 3 (no callbacks after the last attempt)", c)
+	}
+}
