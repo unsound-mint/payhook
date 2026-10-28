@@ -70,7 +70,7 @@ deploy/kind/rollout-load.sh  # rolling restart of the API under load, prints tot
 deploy/kind/down.sh
 ```
 
-CI runs `up.sh` (install + `helm test`) on every push. `rollout-load.sh` is not part of CI: it runs a client pod that creates payments (a new idempotency key per request, 4 parallel loops) for 45 s while `kubectl rollout restart` replaces every API pod. A manual run on a laptop kind cluster (2026-10-29): **8,307 requests, 0 failed**.
+CI runs `up.sh` (install + `helm test`) on every push. `rollout-load.sh` is not part of CI: it runs a client pod that creates payments (a new idempotency key per request, 4 parallel loops) for 45 s while `kubectl rollout restart` replaces every API pod. A manual run on a laptop kind cluster (2026-10-29): **15,064 requests, 0 failed**.
 
 ## Tests
 
