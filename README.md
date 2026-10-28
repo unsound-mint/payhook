@@ -89,9 +89,15 @@ The end-to-end tests start real PostgreSQL and NATS with testcontainers and run 
 
 ## Load test
 
-`loadtest/payments.js` (k6): 200 payment creations/s plus a read of each, 30 seconds, ~2% idempotent replays.
+`loadtest/payments.js` (k6): 200 iterations/s for 30 seconds, each a payment creation with a new idempotency key plus a read of it; ~2% of iterations instead resend the VU's last request and must get the original payment back (200).
 
-On a laptop with everything in Docker Compose: 12,000 requests, 0 errors, p95 2.6 ms for creates.
+```sh
+k6 run loadtest/payments.js
+# without k6 installed:
+docker run --rm -i --network host grafana/k6:1.3.0 run - < loadtest/payments.js
+```
+
+On a laptop with everything in Docker Compose (2026-10-29): 12,002 requests, 0 errors, 139 replays (2.3%), p95 3.3 ms for creates.
 
 ## Layout
 
