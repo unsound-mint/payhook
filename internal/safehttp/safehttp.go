@@ -30,6 +30,9 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("198.18.0.0/15"),
 	netip.MustParsePrefix("240.0.0.0/4"),  // reserved, includes broadcast
 	netip.MustParsePrefix("64:ff9b::/96"), // NAT64: reaches arbitrary IPv4 addresses
+	netip.MustParsePrefix("2002::/16"),    // 6to4: embeds an IPv4 address
+	netip.MustParsePrefix("2001::/32"),    // Teredo: embeds an IPv4 address
+	netip.MustParsePrefix("::/96"),        // IPv4-compatible (deprecated)
 }
 
 // Blocked reports whether a is loopback, private, link-local (which includes

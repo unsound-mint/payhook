@@ -63,7 +63,7 @@ func (j *JetStream) Close() {
 	}
 	select {
 	case <-j.closed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(3 * time.Second): // part of the worker's shutdown budget
 		j.nc.Close()
 	}
 }

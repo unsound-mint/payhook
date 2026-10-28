@@ -24,6 +24,10 @@ func TestBlocked(t *testing.T) {
 		"fd00:ec2::254":    true, // AWS metadata over IPv6
 		"fe80::1":          true,
 		"64:ff9b::a00:1":   true, // NAT64 for 10.0.0.1
+		"2002:a00:1::1":    true, // 6to4 for 10.0.0.1
+		"2001:0:a00:1::1":  true, // Teredo
+		"::7f00:1":         true, // IPv4-compatible 127.0.0.1
+		"2001:4860::8888":  false,
 		"93.184.216.34":    false,
 		"2606:4700::1111":  false,
 	} {
