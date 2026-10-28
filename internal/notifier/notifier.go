@@ -2,7 +2,9 @@
 //
 // Delivery is at least once end to end, so this consumer:
 //   - skips messages it already processed (processed_messages table),
-//   - retries failed callbacks with growing delays (NakWithDelay),
+//   - retries failed callbacks with growing delays (NakWithDelay), counting
+//     them in delivery_attempts; failures on our side (database errors,
+//     shutdown) are retried without using up an attempt,
 //   - parks a message in dead_letters after the last attempt instead of
 //     retrying forever.
 //
@@ -37,16 +39,15 @@ const consumerName = "notifier"
 // max number of attempts.
 var DefaultBackoff = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
 
+// Shutdown budget, which must fit in the pod's 30s termination grace period:
+// drainTimeout + broker close (3s) + up to handleTimeout for a handler still
+// holding a database connection when the pool closes = 25s.
 const (
-	// handleTimeout bounds one message. It stays below AckWait so a stuck handler
-	// gives up before the broker hands the message to another worker.
-	handleTimeout = 15 * time.Second
-	// drainTimeout bounds shutdown; the pod's termination grace period is 30s.
+	// handleTimeout bounds one message: a 5s callback plus a few queries.
+	handleTimeout = 10 * time.Second
+	// drainTimeout bounds how long shutdown waits for the message in progress.
 	// Anything still unacked after it is redelivered after AckWait.
-	drainTimeout = 20 * time.Second
-	// pullBuffer is how many messages are fetched ahead. Their AckWait runs while
-	// they sit in the buffer, and shutdown processes the whole buffer, so keep it small.
-	pullBuffer = 10
+	drainTimeout = 12 * time.Second
 	// dbRetryDelay is the redelivery delay after our own (database) failures.
 	dbRetryDelay = time.Second
 )
@@ -75,9 +76,10 @@ func (n *Notifier) Run(ctx context.Context, js jetstream.JetStream) error {
 		Durable:   consumerName,
 		AckPolicy: jetstream.AckExplicitPolicy,
 		AckWait:   30 * time.Second,
-		// Unlimited: handle caps the attempts itself. With a broker-side limit,
-		// a message whose last attempt hit a database error (or a failed
-		// dead-letter insert) would never be redelivered and would be lost.
+		// Unlimited: handle caps the callback attempts itself (delivery_attempts).
+		// The broker's delivery count also grows on our own failures, and with a
+		// broker-side limit a message whose last delivery hit a database error
+		// (or a failed dead-letter insert) would never be redelivered.
 		MaxDeliver:    -1,
 		FilterSubject: broker.Subjects,
 	})
@@ -90,12 +92,17 @@ func (n *Notifier) Run(ctx context.Context, js jetstream.JetStream) error {
 		hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), handleTimeout)
 		defer cancel()
 		n.handle(hctx, msg)
-	}, jetstream.PullMaxMessages(pullBuffer))
+	},
+		// The handler runs serially, and AckWait runs from the moment a message
+		// is fetched, so prefetching more would let messages time out in the
+		// buffer and be redelivered to another worker (a second callback).
+		// Fetch one at a time; handle also resets AckWait when it starts.
+		jetstream.PullMaxMessages(1))
 	if err != nil {
 		return err
 	}
 	<-ctx.Done()
-	// Stop fetching, finish the message in progress and the buffered ones.
+	// Stop fetching and finish the message in progress (and the prefetched one).
 	cc.Drain()
 	select {
 	case <-cc.Closed():
@@ -106,38 +113,47 @@ func (n *Notifier) Run(ctx context.Context, js jetstream.JetStream) error {
 }
 
 func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
+	// Restart AckWait now that processing begins (see PullMaxMessages in Run).
+	settle(n.log, "in_progress", msg.InProgress())
+
 	var ev payment.Event
 	if err := json.Unmarshal(msg.Data(), &ev); err != nil || ev.ID == "" {
 		n.log.Error("dropping malformed message", "err", err)
 		settle(n.log, "term", msg.Term())
 		return
 	}
-	attempt := uint64(1)
+	delivery := uint64(1)
 	if meta, err := msg.Metadata(); err == nil {
-		attempt = meta.NumDelivered
+		delivery = meta.NumDelivered
 	}
-	log := n.log.With("event_id", ev.ID, "type", ev.Type, "attempt", attempt)
+	log := n.log.With("event_id", ev.ID, "type", ev.Type, "delivery", delivery)
+	defer func() {
+		if r := recover(); r != nil {
+			n.failedAttempt(ctx, log, msg, ev.ID, fmt.Errorf("panic: %v", r), false)
+		}
+	}()
 
-	done, err := n.alreadyProcessed(ctx, ev.ID)
+	// Our own failures below are retried without limit and never count as an
+	// attempt: a database outage must not use up the merchant's retries.
+	st, err := n.state(ctx, ev.ID)
 	if err != nil {
-		n.retry(ctx, log, msg, ev.ID, n.lastAttempt(attempt), fmt.Errorf("dedupe check: %w", err), dbRetryDelay)
+		n.ourFailure(log, msg, fmt.Errorf("state lookup: %w", err))
 		return
 	}
-	if done {
+	if st.processed {
 		metrics.Deliveries.WithLabelValues("duplicate").Inc()
 		settle(log, "ack", msg.Ack())
 		return
 	}
-	if attempt > uint64(len(n.Backoff))+1 {
-		// Redelivered after the last attempt because parking it failed (or our
-		// own failures used up the attempts): don't call the merchant again.
-		n.retry(ctx, log, msg, ev.ID, true, errors.New("redelivered after the last attempt, earlier errors are in the logs"), dbRetryDelay)
+	if st.attempts >= n.maxAttempts() {
+		// The last attempt failed but parking the message didn't succeed.
+		n.giveUp(ctx, log, msg, ev.ID, errors.New(st.lastError))
 		return
 	}
 
 	url, err := n.store.CallbackURL(ctx, ev.PaymentID)
 	if err != nil && !errors.Is(err, payment.ErrNotFound) {
-		n.retry(ctx, log, msg, ev.ID, n.lastAttempt(attempt), fmt.Errorf("callback lookup: %w", err), dbRetryDelay)
+		n.ourFailure(log, msg, fmt.Errorf("callback lookup: %w", err))
 		return
 	}
 	if url == "" {
@@ -149,15 +165,12 @@ func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
 
 	// Re-checked here for URLs stored before validation existed; retrying won't fix them.
 	if err := safehttp.CheckURL(url, n.allowPrivate); err != nil {
-		n.retry(ctx, log, msg, ev.ID, true, fmt.Errorf("callback_url: %w", err), 0)
+		n.giveUp(ctx, log, msg, ev.ID, fmt.Errorf("callback_url: %w", err))
 		return
 	}
 	if err := n.deliver(ctx, url, msg.Data()); err != nil {
-		var delay time.Duration
-		if !n.lastAttempt(attempt) {
-			delay = n.Backoff[attempt-1]
-		}
-		n.retry(ctx, log, msg, ev.ID, n.lastAttempt(attempt), err, delay)
+		// A blocked address (resolved at dial time) won't change on retry.
+		n.failedAttempt(ctx, log, msg, ev.ID, err, errors.Is(err, safehttp.ErrBlocked))
 		return
 	}
 	n.markProcessed(ctx, ev.ID)
@@ -165,18 +178,39 @@ func (n *Notifier) handle(ctx context.Context, msg jetstream.Msg) {
 	settle(log, "ack", msg.Ack())
 }
 
-func (n *Notifier) lastAttempt(attempt uint64) bool { return attempt > uint64(len(n.Backoff)) }
+func (n *Notifier) maxAttempts() int { return len(n.Backoff) + 1 }
 
-// retry settles a failed attempt: redeliver after delay or, when final, park
-// the message in dead_letters. It is only terminated after the dead letter is
-// stored; otherwise it is redelivered and parking is retried.
-func (n *Notifier) retry(ctx context.Context, log *slog.Logger, msg jetstream.Msg, id string, final bool, cause error, delay time.Duration) {
-	if !final {
-		log.Warn("attempt failed, retrying", "err", cause, "in", delay)
-		metrics.Deliveries.WithLabelValues("retry").Inc()
-		settle(log, "nak", msg.NakWithDelay(delay))
+// ourFailure redelivers after a failure on our side, without counting an attempt.
+func (n *Notifier) ourFailure(log *slog.Logger, msg jetstream.Msg, err error) {
+	log.Error("processing failed, will retry", "err", err, "in", dbRetryDelay)
+	metrics.Deliveries.WithLabelValues("error").Inc()
+	settle(log, "nak", msg.NakWithDelay(dbRetryDelay))
+}
+
+// failedAttempt records a failed callback and either schedules the next attempt
+// or, after the last one (or when final), parks the message in dead_letters.
+func (n *Notifier) failedAttempt(ctx context.Context, log *slog.Logger, msg jetstream.Msg, id string, cause error, final bool) {
+	attempts, err := n.recordAttempt(ctx, id, cause)
+	if err != nil {
+		// Not counted, so the merchant may get one extra attempt; better than
+		// giving up because our database was briefly unavailable.
+		log.Error("recording attempt failed", "err", err, "cause", cause)
+		settle(log, "nak", msg.NakWithDelay(dbRetryDelay))
 		return
 	}
+	if final || attempts >= n.maxAttempts() {
+		n.giveUp(ctx, log, msg, id, cause)
+		return
+	}
+	delay := n.Backoff[attempts-1]
+	log.Warn("callback failed, retrying", "err", cause, "attempt", attempts, "in", delay)
+	metrics.Deliveries.WithLabelValues("retry").Inc()
+	settle(log, "nak", msg.NakWithDelay(delay))
+}
+
+// giveUp parks the message in dead_letters. It is only terminated after the
+// dead letter is stored; otherwise it is redelivered and parking is retried.
+func (n *Notifier) giveUp(ctx context.Context, log *slog.Logger, msg jetstream.Msg, id string, cause error) {
 	if err := n.deadLetter(ctx, id, msg.Data(), cause); err != nil {
 		log.Error("dead letter insert failed, will retry", "err", err, "cause", cause)
 		settle(log, "nak", msg.NakWithDelay(dbRetryDelay))
@@ -217,11 +251,33 @@ func settle(log *slog.Logger, op string, err error) {
 	}
 }
 
-func (n *Notifier) alreadyProcessed(ctx context.Context, id string) (bool, error) {
-	var ok bool
-	err := n.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM processed_messages WHERE consumer = $1 AND message_id = $2)`,
-		consumerName, id).Scan(&ok)
-	return ok, err
+type msgState struct {
+	processed bool
+	attempts  int    // failed callbacks so far
+	lastError string // of the last failed callback
+}
+
+func (n *Notifier) state(ctx context.Context, id string) (msgState, error) {
+	var st msgState
+	err := n.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM processed_messages WHERE consumer = $1 AND message_id = $2),
+		       COALESCE(a.attempts, 0), COALESCE(a.last_error, '')
+		FROM (SELECT 1) one
+		LEFT JOIN delivery_attempts a ON a.consumer = $1 AND a.message_id = $2`,
+		consumerName, id).Scan(&st.processed, &st.attempts, &st.lastError)
+	return st, err
+}
+
+// recordAttempt counts a failed callback and returns the new total.
+func (n *Notifier) recordAttempt(ctx context.Context, id string, cause error) (int, error) {
+	var attempts int
+	err := n.pool.QueryRow(ctx, `
+		INSERT INTO delivery_attempts (consumer, message_id, attempts, last_error) VALUES ($1, $2, 1, $3)
+		ON CONFLICT (consumer, message_id) DO UPDATE
+		SET attempts = delivery_attempts.attempts + 1, last_error = EXCLUDED.last_error, updated_at = now()
+		RETURNING attempts`,
+		consumerName, id, cause.Error()).Scan(&attempts)
+	return attempts, err
 }
 
 func (n *Notifier) markProcessed(ctx context.Context, id string) {
@@ -231,14 +287,19 @@ func (n *Notifier) markProcessed(ctx context.Context, id string) {
 	}
 }
 
-// deadLetter stores the message and marks it processed in one statement, so a
-// crash in between can't leave a dead letter that is then delivered again.
+// deadLetter marks the message processed and stores it in one statement, so a
+// crash in between can't leave a dead letter that is then delivered again. The
+// dead letter is only written by whoever inserted the processed row, so two
+// copies of the message racing here produce one dead letter, not two.
 func (n *Notifier) deadLetter(ctx context.Context, id string, payload []byte, cause error) error {
 	_, err := n.pool.Exec(ctx, `
-		WITH dl AS (
-			INSERT INTO dead_letters (consumer, message_id, payload, last_error) VALUES ($1, $2, $3, $4)
+		WITH p AS (
+			INSERT INTO processed_messages (consumer, message_id) VALUES ($1, $2)
+			ON CONFLICT DO NOTHING
+			RETURNING consumer, message_id
 		)
-		INSERT INTO processed_messages (consumer, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+		INSERT INTO dead_letters (consumer, message_id, payload, last_error)
+		SELECT consumer, message_id, $3::jsonb, $4::text FROM p`,
 		consumerName, id, payload, cause.Error())
 	return err
 }

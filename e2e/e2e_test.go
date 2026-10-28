@@ -421,8 +421,33 @@ func TestShutdownFinishesInFlightCallback(t *testing.T) {
 	}
 }
 
+// deliveries is how many times the broker has delivered messages to the
+// notifier consumer, redeliveries included.
+func (e *env) deliveries(t *testing.T) uint64 {
+	t.Helper()
+	c, err := e.js.JS.Consumer(context.Background(), broker.Stream, "notifier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := c.Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Delivered.Consumer
+}
+
+func (e *env) deadLetters(t *testing.T, paymentID string) (n int, lastError string) {
+	t.Helper()
+	if err := e.pool.QueryRow(context.Background(), `SELECT count(*), COALESCE(max(d.last_error), '')
+		FROM dead_letters d JOIN outbox o ON o.id::text = d.message_id WHERE o.aggregate_id = $1`, paymentID).Scan(&n, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	return n, lastError
+}
+
 // A merchant that never accepts: after the last attempt the event is parked in
-// dead_letters exactly once, also when the first try to park it fails.
+// dead_letters exactly once with the merchant's error, also when the first try
+// to park it fails, and the merchant isn't called again after the last attempt.
 func TestDeadLetterAfterLastAttempt(t *testing.T) {
 	e := setupWithoutNotifier(t)
 	e.runNotifier(e.ctx, func(n *notifier.Notifier) { n.Backoff = []time.Duration{50 * time.Millisecond, 50 * time.Millisecond} })
@@ -434,7 +459,7 @@ func TestDeadLetterAfterLastAttempt(t *testing.T) {
 	}))
 	defer merchant.Close()
 
-	// Make the first dead-letter insert fail.
+	// Make the dead-letter inserts fail until the table is back.
 	ctx := context.Background()
 	if _, err := e.pool.Exec(ctx, `ALTER TABLE dead_letters RENAME TO dead_letters_away`); err != nil {
 		t.Fatal(err)
@@ -444,23 +469,56 @@ func TestDeadLetterAfterLastAttempt(t *testing.T) {
 	if _, out := e.webhook(t, map[string]string{"id": "evt_dlq", "type": "payment.succeeded", "payment_id": id}); out != payment.OutcomeApplied {
 		t.Fatalf("webhook: %s", out)
 	}
-	waitFor(t, 15*time.Second, "three callback attempts", func() bool { return calls.Load() == 3 })
-	time.Sleep(300 * time.Millisecond) // let the dead-letter insert fail at least once
+	// Three deliveries make the three attempts; a fifth delivery is only possible
+	// if the third and fourth were not terminated, i.e. parking failed twice.
+	waitFor(t, 15*time.Second, "redelivery after a failed dead-letter insert", func() bool { return e.deliveries(t) >= 5 })
+	if c := calls.Load(); c != 3 {
+		t.Fatalf("merchant called %d times before parking, want 3", c)
+	}
 	if _, err := e.pool.Exec(ctx, `ALTER TABLE dead_letters_away RENAME TO dead_letters`); err != nil {
 		t.Fatal(err)
 	}
 
-	waitFor(t, 15*time.Second, "dead letter", func() bool {
-		var n int
-		err := e.pool.QueryRow(ctx, `SELECT count(*) FROM dead_letters d JOIN outbox o ON o.id::text = d.message_id
-			WHERE o.aggregate_id = $1 AND d.last_error <> ''`, id).Scan(&n)
-		return err == nil && n == 1
-	})
+	waitFor(t, 15*time.Second, "dead letter", func() bool { n, _ := e.deadLetters(t, id); return n == 1 })
+	if _, lastErr := e.deadLetters(t, id); lastErr != "merchant responded 500" {
+		t.Fatalf("last_error = %q, want the merchant's error", lastErr)
+	}
 	if n := e.processedCallbacks(t, id); n != 1 {
 		t.Fatalf("processed = %d, want 1", n)
 	}
 	if c := calls.Load(); c != 3 {
 		t.Fatalf("merchant called %d times, want 3 (no callbacks after the last attempt)", c)
+	}
+}
+
+// Our own database failing for longer than all the retries together must not
+// use up the merchant's attempts: once it's back, the callback goes out.
+func TestDatabaseOutageDoesNotUseUpAttempts(t *testing.T) {
+	e := setupWithoutNotifier(t)
+	e.runNotifier(e.ctx, func(n *notifier.Notifier) { n.Backoff = []time.Duration{50 * time.Millisecond, 50 * time.Millisecond} })
+
+	var calls atomic.Int32
+	merchant := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls.Add(1) }))
+	defer merchant.Close()
+
+	_, p := e.createPayment(t, "order-outage", map[string]any{"merchant_id": "shop-1", "amount": 100, "currency": "KZT", "callback_url": merchant.URL})
+	id := p["id"].(string)
+	// Every lookup the notifier does first now fails, like a database outage.
+	ctx := context.Background()
+	if _, err := e.pool.Exec(ctx, `ALTER TABLE processed_messages RENAME TO processed_messages_away`); err != nil {
+		t.Fatal(err)
+	}
+	if _, out := e.webhook(t, map[string]string{"id": "evt_outage", "type": "payment.succeeded", "payment_id": id}); out != payment.OutcomeApplied {
+		t.Fatalf("webhook: %s", out)
+	}
+	waitFor(t, 20*time.Second, "deliveries past the attempt limit", func() bool { return e.deliveries(t) >= 6 })
+	if _, err := e.pool.Exec(ctx, `ALTER TABLE processed_messages_away RENAME TO processed_messages`); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 15*time.Second, "callback after recovery", func() bool { return e.processedCallbacks(t, id) == 1 })
+	if n, _ := e.deadLetters(t, id); n != 0 || calls.Load() != 1 {
+		t.Fatalf("dead letters = %d, merchant calls = %d; want 0 and 1", n, calls.Load())
 	}
 }
 
