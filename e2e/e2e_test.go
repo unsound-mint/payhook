@@ -287,8 +287,9 @@ func TestBadSignatureRejected(t *testing.T) {
 	}
 }
 
-// Many concurrent deliveries — same event and competing events — must change
-// the payment exactly once and write exactly one outbox row.
+// Many concurrent deliveries of one "succeeded" event racing distinct
+// "failed" events for the same payment: exactly one of them changes the
+// payment, it ends in the winner's status, and there is exactly one outbox row.
 func TestConcurrentWebhooks(t *testing.T) {
 	e := setup(t)
 	_, p := e.createPayment(t, "order-race", map[string]any{"merchant_id": "shop-1", "amount": 100, "currency": "KZT"})
@@ -301,11 +302,11 @@ func TestConcurrentWebhooks(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			evID := "evt_same"
+			ev := map[string]string{"id": "evt_same", "type": "payment.succeeded", "payment_id": id}
 			if i%3 == 0 {
-				evID = fmt.Sprintf("evt_other_%d", i) // different event, same target status
+				ev = map[string]string{"id": fmt.Sprintf("evt_failed_%d", i), "type": "payment.failed", "payment_id": id}
 			}
-			_, out, err := e.sendWebhook(map[string]string{"id": evID, "type": "payment.succeeded", "payment_id": id})
+			_, out, err := e.sendWebhook(ev)
 			if err != nil {
 				t.Error(err)
 				return
@@ -321,11 +322,49 @@ func TestConcurrentWebhooks(t *testing.T) {
 		t.Fatalf("applied %d times, want exactly 1: %v", outcomes[payment.OutcomeApplied], outcomes)
 	}
 	var n int
-	if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM outbox WHERE aggregate_id = $1`, id).Scan(&n); err != nil {
+	var status, eventType string
+	if err := e.pool.QueryRow(context.Background(), `SELECT count(*), max(o.event_type), max(p.status)
+		FROM outbox o JOIN payments p ON p.id = o.aggregate_id WHERE o.aggregate_id = $1`, id).Scan(&n, &eventType, &status); err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("outbox rows = %d, want 1", n)
+	if n != 1 || eventType != payment.EventType(payment.Status(status)) {
+		t.Fatalf("outbox rows = %d with %q for status %q, want 1 matching row", n, eventType, status)
+	}
+	t.Logf("winner: %s, outcomes: %v", status, outcomes)
+}
+
+// Concurrent creates with the same key and body: one payment, one 201.
+func TestConcurrentCreateSameKey(t *testing.T) {
+	e := setup(t)
+	b, _ := json.Marshal(map[string]any{"merchant_id": "shop-1", "amount": 500, "currency": "KZT"})
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	codes := map[int]int{}
+	ids := map[string]bool{}
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequest(http.MethodPost, e.api.URL+"/v1/payments", bytes.NewReader(b))
+			req.Header.Set("Idempotency-Key", "order-concurrent")
+			code, out, err := send(req)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			codes[code]++
+			if id, ok := out["id"].(string); ok {
+				ids[id] = true
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if codes[http.StatusCreated] != 1 || codes[http.StatusOK] != 19 || len(ids) != 1 {
+		t.Fatalf("codes %v, %d distinct ids; want one 201, nineteen 200, one id", codes, len(ids))
 	}
 }
 

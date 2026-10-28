@@ -23,7 +23,7 @@ Three binaries from one codebase: **api** (REST + webhooks), **relay** (outbox �
 | Problem | How |
 |---|---|
 | Merchant retries `POST /payments` after a timeout | `Idempotency-Key` + unique `(merchant_id, idempotency_key)`. Same key and body → the original payment (200). Same key, different body → 422. |
-| Provider delivers the same webhook twice, or 30 times at once | Primary key on `(provider, event_id)` inside the same transaction as the status change; the payment row is locked `FOR UPDATE`. Tested with 30 concurrent deliveries → exactly one status change, one outbox row. |
+| Provider delivers the same webhook twice, or 30 times at once | Primary key on `(provider, event_id)` inside the same transaction as the status change; the payment row is locked `FOR UPDATE`. Tested with 30 concurrent deliveries, duplicates of one `succeeded` event racing `failed` events → exactly one status change, one outbox row. |
 | Webhooks arrive out of order (`failed` after `succeeded`) | Explicit state machine (`pending → succeeded/failed/canceled`, `succeeded → refunded`). Invalid transitions are recorded and acknowledged with 200, so the provider stops retrying, but never applied. |
 | Forged or replayed webhooks | HMAC-SHA256 over `timestamp.body`, constant-time comparison, 5-minute tolerance window. |
 | Crash between "update DB" and "publish event" | Transactional outbox: the event is written in the same transaction as the change; the relay publishes it afterwards. Several relays can run in parallel (`SKIP LOCKED`). |
@@ -80,7 +80,11 @@ make test     # unit + end-to-end, race detector on
 The end-to-end tests start real PostgreSQL and NATS with testcontainers and run the API, relay and worker together:
 
 - full lifecycle: idempotent create, webhook applied, redelivery ignored, out-of-order event rejected, merchant callback that fails once and then succeeds — exactly one accepted callback;
-- 30 concurrent deliveries of competing webhooks → one status change, one outbox row;
+- 30 concurrent webhooks for one payment, redeliveries of one `succeeded` event racing distinct `failed` events → exactly one status change, the payment ends in the winner's status, one outbox row;
+- 20 concurrent creates with the same idempotency key → one payment, one 201;
+- a merchant that never accepts → one dead letter after the last attempt, also when the first dead-letter write fails;
+- shutdown during a callback → the callback completes and is recorded before the worker exits;
+- an outbox row that isn't a valid event is set aside without blocking the rows behind it;
 - bad signature → 401.
 
 ## Load test
