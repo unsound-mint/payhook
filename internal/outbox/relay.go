@@ -123,8 +123,9 @@ func (r *Relay) PublishBatch(ctx context.Context) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		// Stop at the first failure so events keep their order; the rest are
-		// retried on the next tick.
+		// Stop at the first failure so this relay publishes in id order; the rest
+		// are retried on the next tick. That is not end-to-end ordering: parallel
+		// relays and the worker's retries can still reorder events downstream.
 		if err := r.pub.Publish(ctx, "payments."+ev.Type, ev.ID, data); err != nil {
 			r.log.Warn("publish failed, will retry", "outbox_id", it.id, "err", err)
 			break

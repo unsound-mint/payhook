@@ -60,7 +60,7 @@ Prometheus is on `localhost:9090`; useful series: `payhook_webhooks_total` by ou
 - readiness and liveness probes, `preStop` sleep and graceful shutdown, `maxUnavailable: 0` rolling updates;
 - HPA for the API, PodDisruptionBudget, topology spread across nodes;
 - non-root, read-only root filesystem, all capabilities dropped, seccomp `RuntimeDefault`;
-- secrets from the chart or an `existingSecret` (e.g. synced from AWS Secrets Manager), with pods rolled when they change;
+- secrets from the chart or an `existingSecret` (e.g. synced from AWS Secrets Manager); pods roll automatically when the chart-managed secret changes, while changes to an `existingSecret` need a restart (or a reloader);
 - optional Ingress and Prometheus Operator `ServiceMonitor`;
 - `helm test` smoke test.
 
@@ -109,6 +109,10 @@ e2e                              testcontainers end-to-end tests
 deploy/helm/payhook              Helm chart
 deploy/kind                      local Kubernetes setup (also used in CI)
 ```
+
+## Known limitations
+
+- Event order is not guaranteed end to end. The relay publishes in outbox order, but parallel relays, broker redeliveries and callback retries can deliver a later event before an earlier one. Merchants should compare event `id`s (numeric strings) per payment (status changes of one payment are serialised, so its ids increase in order) or `occurred_at`, and treat the payment's current status as the source of truth.
 
 ## Trade-offs and next steps
 

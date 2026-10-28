@@ -22,7 +22,8 @@ components:
       requests: { cpu: 50m, memory: 64Mi }
       limits: { memory: 256Mi }
   relay:
-    # Safe to run more than one (FOR UPDATE SKIP LOCKED), but one keeps event order simple.
+    # Safe to run more than one (FOR UPDATE SKIP LOCKED). One relay publishes in
+    # outbox order, but events aren't ordered end to end either way (see README).
     replicas: 1
     metricsPort: 9101
     resources:

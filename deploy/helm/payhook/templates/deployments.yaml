@@ -22,7 +22,8 @@ spec:
     metadata:
       labels: {{- include "payhook.selector" $ctx | nindent 8 }}
       annotations:
-        # Roll the pods when the secret changes.
+        # Roll the pods when the chart-managed secret changes. An existingSecret
+        # isn't seen here: restart the pods (or use a reloader) when it changes.
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") $ | sha256sum }}
         {{- with $.Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{ end }}
     spec:
