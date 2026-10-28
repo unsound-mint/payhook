@@ -424,3 +424,38 @@ func TestDeadLetterAfterLastAttempt(t *testing.T) {
 		t.Fatalf("merchant called %d times, want 3 (no callbacks after the last attempt)", c)
 	}
 }
+
+// Rows that can't become an event must not block the rows behind them.
+func TestRelaySkipsInvalidOutboxRows(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	var badShape, noType, good int64
+	for _, row := range []struct {
+		payload string
+		id      *int64
+	}{
+		{`{"type":"payment.succeeded","amount":"not a number"}`, &badShape},
+		{`{"amount":100}`, &noType},
+		{`{"type":"payment.succeeded","payment_id":"00000000-0000-0000-0000-000000000000","amount":100}`, &good},
+	} {
+		if err := e.pool.QueryRow(ctx, `INSERT INTO outbox (aggregate_id, event_type, payload)
+			VALUES (gen_random_uuid(), 'payment.succeeded', $1) RETURNING id`, row.payload).Scan(row.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, 10*time.Second, "valid row published", func() bool {
+		var published bool
+		err := e.pool.QueryRow(ctx, `SELECT published_at IS NOT NULL FROM outbox WHERE id = $1`, good).Scan(&published)
+		return err == nil && published
+	})
+	for _, id := range []int64{badShape, noType} {
+		var failed, published bool
+		if err := e.pool.QueryRow(ctx, `SELECT failed_at IS NOT NULL AND last_error <> '', published_at IS NOT NULL
+			FROM outbox WHERE id = $1`, id).Scan(&failed, &published); err != nil {
+			t.Fatal(err)
+		}
+		if !failed || published {
+			t.Fatalf("row %d: failed=%v published=%v, want failed and not published", id, failed, published)
+		}
+	}
+}

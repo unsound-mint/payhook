@@ -27,6 +27,11 @@ var (
 		Help: "Outbox events published to the broker.",
 	})
 
+	OutboxFailed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "payhook_outbox_failed_total",
+		Help: "Outbox rows set aside because they are not a valid event. Should stay at zero.",
+	})
+
 	OutboxBacklog = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "payhook_outbox_backlog",
 		Help: "Outbox events not yet published. Should stay near zero.",

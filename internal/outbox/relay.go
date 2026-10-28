@@ -10,6 +10,7 @@ package outbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strconv"
 	"time"
@@ -62,7 +63,8 @@ func (r *Relay) Run(ctx context.Context) error {
 	}
 }
 
-// PublishBatch publishes up to batchSize unpublished events and marks them.
+// PublishBatch publishes up to batchSize unpublished events and marks them,
+// returning how many rows it settled (published or set aside as failed).
 // FOR UPDATE SKIP LOCKED lets several relay replicas run without publishing
 // the same rows at the same time.
 func (r *Relay) PublishBatch(ctx context.Context) (int, error) {
@@ -74,7 +76,7 @@ func (r *Relay) PublishBatch(ctx context.Context) (int, error) {
 
 	rows, err := tx.Query(ctx, `
 		SELECT id, payload FROM outbox
-		WHERE published_at IS NULL
+		WHERE published_at IS NULL AND failed_at IS NULL
 		ORDER BY id
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED`, r.batchSize)
@@ -98,10 +100,23 @@ func (r *Relay) PublishBatch(ctx context.Context) (int, error) {
 	}
 
 	var published []int64
+	failed := 0
 	for _, it := range items {
 		var ev payment.Event
-		if err := json.Unmarshal(it.payload, &ev); err != nil {
-			return 0, err
+		bad := json.Unmarshal(it.payload, &ev)
+		if bad == nil && ev.Type == "" {
+			bad = errors.New("event has no type")
+		}
+		if bad != nil {
+			// Retrying can't fix the payload: set the row aside so the rows
+			// behind it still go out. It stays in the table for inspection.
+			r.log.Error("outbox row is not a valid event, marking failed", "outbox_id", it.id, "err", bad)
+			if _, err := tx.Exec(ctx, `UPDATE outbox SET failed_at = now(), last_error = $2 WHERE id = $1`, it.id, bad.Error()); err != nil {
+				return 0, err
+			}
+			metrics.OutboxFailed.Inc()
+			failed++
+			continue
 		}
 		ev.ID = strconv.FormatInt(it.id, 10)
 		data, err := json.Marshal(ev)
@@ -117,7 +132,7 @@ func (r *Relay) PublishBatch(ctx context.Context) (int, error) {
 		published = append(published, it.id)
 	}
 	if len(published) == 0 {
-		return 0, tx.Commit(ctx)
+		return failed, tx.Commit(ctx)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE outbox SET published_at = now() WHERE id = ANY($1)`, published); err != nil {
 		return 0, err
@@ -128,12 +143,12 @@ func (r *Relay) PublishBatch(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	metrics.OutboxPublished.Add(float64(len(published)))
-	return len(published), nil
+	return len(published) + failed, nil
 }
 
 func (r *Relay) updateBacklog(ctx context.Context) {
 	var n int64
-	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE published_at IS NULL`).Scan(&n); err == nil {
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE published_at IS NULL AND failed_at IS NULL`).Scan(&n); err == nil {
 		metrics.OutboxBacklog.Set(float64(n))
 	}
 }
