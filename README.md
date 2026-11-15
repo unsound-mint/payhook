@@ -1,6 +1,6 @@
 # payhook
 
-A payments service in Go that takes payment requests from merchants, receives signed status webhooks from payment providers, and notifies merchants reliably — built around the failure cases that make payment integrations hard: retries, duplicates, out-of-order events and crashes between steps.
+A payments service in Go that takes payment requests from merchants, receives signed status webhooks from payment providers, and notifies merchants reliably. It is built around the failure cases that make payment integrations hard: retries, duplicates, out-of-order events and crashes between steps.
 
 ![ci](https://github.com/unsound-mint/payhook/actions/workflows/ci.yml/badge.svg)
 
@@ -80,7 +80,7 @@ make test     # unit + end-to-end, race detector on
 
 The end-to-end tests start real PostgreSQL and NATS with testcontainers and run the API, relay and worker together:
 
-- full lifecycle: idempotent create, webhook applied, redelivery ignored, out-of-order event rejected, merchant callback that fails once and then succeeds — exactly one accepted callback;
+- full lifecycle: idempotent create, webhook applied, redelivery ignored, out-of-order event rejected, merchant callback that fails once and then succeeds, with exactly one accepted callback;
 - 30 concurrent webhooks for one payment, redeliveries of one `succeeded` event racing distinct `failed` events → exactly one status change, the payment ends in the winner's status, one outbox row;
 - 20 concurrent creates with the same idempotency key → one payment, one 201;
 - a merchant that never accepts → one dead letter with the merchant's error after the last attempt, also when the first dead-letter writes fail, and no callbacks after the last attempt;
